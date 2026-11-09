@@ -34,7 +34,9 @@ const isProduction = process.env.NODE_ENV === 'production';
 const allowedOrigins = [
     'http://localhost:3000',
     'http://127.0.0.1:3000',
-    'https://thepulse-9vi1.onrender.com'
+    'https://thepulse-9vi1.onrender.com',
+    'https://thepulse.centillion.online'
+
 ];
 
 app.use(cors({
