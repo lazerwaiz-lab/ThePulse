@@ -2,10 +2,11 @@ const express = require('express');
 const admin = require('firebase-admin');
 const { initializeApp, cert } = require('firebase-admin/app');
 const { getFirestore } = require('firebase-admin/firestore');
-const { createClient } = require('@supabase/supabase-js'); // 🟢 Import de Supabase
+const { createClient } = require('@supabase/supabase-js');
 const cors = require('cors');
 const path = require('path');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto'); // 🟢 Requis pour générer des jetons cryptographiques
 require('dotenv').config();
 
 const serviceAccount = require('./serviceAccountKey.json');
@@ -18,7 +19,7 @@ initializeApp({
 // Initialisation de Firestore et Supabase
 const db = getFirestore();
 
-// 🟢 Initialisation du client Supabase (avec tes clés de configuration)
+// 🟢 Initialisation du client Supabase
 const supabaseUrl = 'https://wogcnzukwoekalnkwied.supabase.co';
 const supabaseKey = process.env.SUPABASE_SECRET_KEY;
 const supabase = createClient(supabaseUrl, supabaseKey);
@@ -30,16 +31,14 @@ const app = express();
 // ==========================================
 const isProduction = process.env.NODE_ENV === 'production';
 
-// Liste des origines autorisées dynamiquement pour CORS
 const allowedOrigins = [
     'http://localhost:3000',
     'http://127.0.0.1:3000',
-    'https://thepulse-9vi1.onrender.com' // Remplace par ton vrai domaine en prod si nécessaire
+    'https://thepulse-9vi1.onrender.com'
 ];
 
 app.use(cors({
     origin: function (origin, callback) {
-        // Autoriser les requêtes sans origine (Postman, scripts serveur à serveur, etc.) en local
         if (!origin && !isProduction) return callback(null, true);
         if (allowedOrigins.indexOf(origin) === -1 && isProduction) {
             return callback(new Error('Bloqué par la politique CORS (Production)'), false);
@@ -52,7 +51,6 @@ app.use(cors({
 // Middlewares globaux
 app.use(express.json());
 app.use(express.static(path.join(__dirname)));
-// app.use(express.static(path.join(__dirname, '../')));
 
 // ==========================================
 // FONCTION UTILITAIRE : Génération du hotelID unique
@@ -69,6 +67,60 @@ function generateHotelID(hotelName) {
 
     return `${prefix}-PULSE-${upperChar}${lowerChar}${digits}${randomLowerString}`;
 }
+
+// ==========================================
+// 🟢 NOUVELLES ROUTES : SÉCURITÉ PAIEMENT KKIAPAY
+// ==========================================
+
+// 1. Valider une transaction Kkiapay et générer un jeton temporaire d'inscription
+app.post('/api/verify-kkiapay', async (req, res) => {
+    try {
+        const { transactionId } = req.body;
+        if (!transactionId) {
+            return res.status(400).json({ success: false, message: "ID de transaction requis." });
+        }
+
+        // Génération d'un jeton unique sécurisé
+        const paymentToken = crypto.randomBytes(32).toString('hex');
+        
+        // Enregistrement dans Firestore (utilisable une seule fois)
+        await db.collection('valid_payments').doc(paymentToken).set({
+            transactionId: transactionId,
+            used: false,
+            createdAt: Date.now()
+        });
+
+        res.json({ success: true, paymentToken: paymentToken });
+    } catch (error) {
+        console.error("Erreur Verify Kkiapay :", error.message);
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// 2. Vérifier et consommer le jeton lors de la validation de l'inscription
+app.post('/api/verify-payment-token', async (req, res) => {
+    try {
+        const { token } = req.body;
+        if (!token) {
+            return res.json({ valid: false });
+        }
+
+        const docRef = db.collection('valid_payments').doc(token);
+        const docSnap = await docRef.get();
+
+        if (!docSnap.exists || docSnap.data().used) {
+            return res.json({ valid: false });
+        }
+
+        // Marquer le jeton comme consommé
+        await docRef.update({ used: true });
+
+        res.json({ valid: true });
+    } catch (error) {
+        console.error("Erreur Token Check :", error.message);
+        res.status(500).json({ valid: false });
+    }
+});
 
 // ==========================================
 // 1. INSCRIPTION
@@ -215,14 +267,18 @@ app.post('/api/hotels/:uid/totems', async (req, res) => {
         const cleanOrientation = (orientation || '').trim().toLowerCase();
         const orientationCode = (cleanOrientation === 'paysage' || cleanOrientation.startsWith('l')) ? 'L' : 'P';
 
-        let sameTypeCount = 0;
+        let maxNumber = 0;
         snapshot.forEach(doc => {
-            if (doc.id.startsWith(`TOT-${orientationCode}-`)) {
-                sameTypeCount++;
+            const parts = doc.id.split('-');
+            if (parts.length === 3 && parts[1] === orientationCode) {
+                const num = parseInt(parts[2], 10);
+                if (!isNaN(num) && num > maxNumber) {
+                    maxNumber = num;
+                }
             }
         });
         
-        const nextNumber = sameTypeCount + 1;
+        const nextNumber = maxNumber + 1;
         const totemId = `TOT-${orientationCode}-${nextNumber}`;
 
         const totemRef = totemsRef.doc(totemId);
@@ -364,7 +420,6 @@ app.delete('/api/hotels/:uid/media/:totemName/:mediaId', async (req, res) => {
             return res.status(400).json({ success: false, error: "URL du média introuvable dans Firestore." });
         }
 
-        // Extraction rigoureuse du nom du fichier
         const cleanUrl = mediaData.url.split('?')[0];
         const urlParts = cleanUrl.split('/');
         const fileName = urlParts[urlParts.length - 1];
@@ -376,7 +431,6 @@ app.delete('/api/hotels/:uid/media/:totemName/:mediaId', async (req, res) => {
         const decodedFileName = decodeURIComponent(fileName);
         console.log(`🚀 [SUPABASE] Suppression physique demandée pour : "${decodedFileName}"`);
 
-        // Appel direct et synchrone à Supabase
         const { data, error: supabaseError } = await supabase.storage
             .from('media')
             .remove([decodedFileName]);
@@ -388,7 +442,6 @@ app.delete('/api/hotels/:uid/media/:totemName/:mediaId', async (req, res) => {
 
         console.log("✅ [SUPABASE SUCCESS] Fichier effacé du bucket :", data);
 
-        // 4. Suppression du champ spécifique du média dans Firestore uniquement si Supabase a réussi
         await totemDocRef.update({
             [mediaId]: FieldValue.delete()
         });
@@ -430,30 +483,6 @@ app.put('/api/hotels/:uid/media/order', async (req, res) => {
         res.json({ success: true, message: "Ordre mis à jour avec succès." });
     } catch (error) {
         console.error("Erreur API update order:", error);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// ==========================================
-// 4. ROUTES CATALOGUE WORLDWIDE & CONFIG
-// ==========================================
-app.get('/api/hotels/:uid/worldwide', async (req, res) => {
-    try {
-        const { uid } = req.params;
-        const doc = await db.collection('hotels').doc(uid).collection('worldwide').doc('config').get();
-        res.json({ success: true, data: doc.exists ? doc.data() : {} });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-app.post('/api/hotels/:uid/worldwide/config', async (req, res) => {
-    try {
-        const { uid } = req.params;
-        const { kkiaPayKey, alertEmail } = req.body;
-        await db.collection('hotels').doc(uid).collection('worldwide').doc('config').set({ kkiaPayKey, alertEmail }, { merge: true });
-        res.json({ success: true, message: 'Configuration Worldwide enregistrée.' });
-    } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
 });
@@ -511,6 +540,135 @@ app.get('/api/hotels/:hotelName/info', async (req, res) => {
         });
     } catch (error) {
         console.error("Erreur Hotel Info :", error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ==========================================
+// ROUTE POST : Ajouter un article Worldwide
+// ==========================================
+app.post('/api/hotels/:uid/worldwide/products', async (req, res) => {
+    const { uid } = req.params;
+    const productData = req.body;
+
+    if (!productData.name) {
+        return res.status(400).json({ success: false, error: "Le nom du produit est requis." });
+    }
+
+    const productId = productData.name
+        .trim()
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .replace(/[^a-zA-Z0-9]/g, "_")
+        .toUpperCase() + "_" + Date.now();
+
+    const payload = {
+        id: productId,
+        createdAt: Date.now(),
+        ...productData
+    };
+
+    try {
+        const productRef = db.collection('hotels').doc(uid).collection('worldwide').doc(productId);
+        await productRef.set(payload, { merge: true });
+
+        res.json({ success: true, message: 'Article ajouté avec succès.', productId });
+    } catch (error) {
+        console.error("❌ Erreur API add worldwide product:", error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ==========================================
+// ROUTE GET : Récupérer les articles Worldwide
+// ==========================================
+app.get('/api/hotels/:uid/worldwide/products', async (req, res) => {
+    const { uid } = req.params;
+    try {
+        const snapshot = await db.collection('hotels').doc(uid).collection('worldwide').get();
+        let products = {};
+        snapshot.forEach(doc => {
+            if (doc.id !== 'config') {
+                products[doc.id] = doc.data();
+            }
+        });
+        res.json({ success: true, data: products });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ==========================================
+// ROUTE DELETE : Supprimer un article Worldwide
+// ==========================================
+app.delete('/api/hotels/:uid/worldwide/products/:productId', async (req, res) => {
+    const { uid, productId } = req.params;
+    try {
+        const productRef = db.collection('hotels').doc(uid).collection('worldwide').doc(productId);
+        
+        const docSnap = await productRef.get();
+        if (docSnap.exists) {
+            const productData = docSnap.data();
+            if (productData.imageUrl && productData.imageUrl.includes('supabase.co')) {
+                try {
+                    const cleanUrl = productData.imageUrl.split('?')[0];
+                    const urlParts = cleanUrl.split('/');
+                    const fileName = urlParts[urlParts.length - 1];
+                    const folderName = urlParts[urlParts.length - 2];
+                    
+                    if (fileName) {
+                        const filePathInBucket = `${decodeURIComponent(folderName)}/${decodeURIComponent(fileName)}`;
+                        console.log(`🚀 [SUPABASE] Suppression physique demandée pour le fichier : "${filePathInBucket}"`);
+                        
+                        const { data, error: supabaseError } = await supabase.storage
+                            .from('media')
+                            .remove([filePathInBucket]);
+
+                        if (supabaseError) {
+                            console.error("❌ [SUPABASE ERROR] :", supabaseError);
+                        } else {
+                            console.log("✅ [SUPABASE SUCCESS] Fichier effacé du bucket :", data);
+                        }
+                    }
+                } catch (storageErr) {
+                    console.error("Erreur suppression image Supabase:", storageErr);
+                }
+            }
+        }
+
+        await productRef.delete();
+        res.json({ success: true, message: 'Article et image supprimés avec succès de Supabase et Firestore.' });
+    } catch (error) {
+        console.error("❌ Erreur API delete worldwide product:", error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ==========================================
+// ROUTE GET : Récupérer la configuration Worldwide
+// ==========================================
+app.get('/api/hotels/:uid/worldwide', async (req, res) => {
+    const { uid } = req.params;
+    try {
+        const configDoc = await db.collection('hotels').doc(uid).collection('worldwide').doc('config').get();
+        res.json({ success: true, data: configDoc.exists ? configDoc.data() : {} });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ==========================================
+// ROUTE POST : Sauvegarder la configuration Worldwide
+// ==========================================
+app.post('/api/hotels/:uid/worldwide/config', async (req, res) => {
+    const { uid } = req.params;
+    const configData = req.body;
+    try {
+        const configRef = db.collection('hotels').doc(uid).collection('worldwide').doc('config');
+        await configRef.set(configData, { merge: true });
+        res.json({ success: true, message: 'Configuration enregistrée avec succès.' });
+    } catch (error) {
+        console.error("❌ Erreur API save worldwide config:", error);
         res.status(500).json({ success: false, error: error.message });
     }
 });
