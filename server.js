@@ -293,6 +293,9 @@ app.post('/api/hotels/:uid/totems', async (req, res) => {
         
         await totemRef.set(totemData, { merge: true });
 
+        // 🟢 NOTIFICATION SSE EN TEMPS RÉEL
+        notifyTotems(uid);
+
         res.json({ success: true, message: 'Totem ajouté avec succès', id: totemId, totem: totemData });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
@@ -340,6 +343,9 @@ app.delete('/api/hotels/:uid/totems/:totemId', async (req, res) => {
         }
 
         await totemRef.delete();
+
+        // 🟢 NOTIFICATION SSE EN TEMPS RÉEL
+        notifyTotems(uid);
 
         res.json({ success: true, message: 'Totem et médias associés supprimés avec succès.' });
     } catch (error) {
@@ -393,6 +399,9 @@ app.post('/api/hotels/:uid/media/:totemName', async (req, res) => {
                 createdAt: Date.now()
             }
         }, { merge: true });
+
+        // 🟢 NOTIFICATION SSE EN TEMPS RÉEL
+        notifyTotems(uid);
 
         res.json({ success: true, message: 'Média enregistré avec succès.', mediaId });
     } catch (error) {
@@ -448,6 +457,9 @@ app.delete('/api/hotels/:uid/media/:totemName/:mediaId', async (req, res) => {
             [mediaId]: FieldValue.delete()
         });
         
+        // 🟢 NOTIFICATION SSE EN TEMPS RÉEL
+        notifyTotems(uid);
+
         res.json({ success: true, message: 'Média supprimé avec succès de Supabase et Firestore.' });
     } catch (error) {
         console.error("❌ Erreur API delete media:", error);
@@ -481,6 +493,9 @@ app.put('/api/hotels/:uid/media/order', async (req, res) => {
         });
 
         await batch.commit();
+
+        // 🟢 NOTIFICATION SSE EN TEMPS RÉEL
+        notifyTotems(uid);
 
         res.json({ success: true, message: "Ordre mis à jour avec succès." });
     } catch (error) {
@@ -674,6 +689,39 @@ app.post('/api/hotels/:uid/worldwide/config', async (req, res) => {
         res.status(500).json({ success: false, error: error.message });
     }
 });
+
+// ==========================================
+// ROUTE SSE (Server-Sent Events) pour les Totems
+// ==========================================
+let totemClients = {}; // Stocke les connexions des totems par hôtel
+
+app.get('/api/hotels/:uid/events', (req, res) => {
+    const { uid } = req.params;
+    
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+
+    if (!totemClients[uid]) {
+        totemClients[uid] = [];
+    }
+    totemClients[uid].push(res);
+
+    // Si le client se déconnecte, on le retire de la liste
+    req.on('close', () => {
+        totemClients[uid] = totemClients[uid].filter(client => client !== res);
+    });
+});
+
+// Fonction utilitaire pour notifier tous les totems d'un hôtel
+function notifyTotems(uid) {
+    if (totemClients[uid]) {
+        totemClients[uid].forEach(client => {
+            client.write(`data: update\n\n`);
+        });
+    }
+}
 
 // 8. Lancement dynamique du serveur selon l'environnement
 const PORT = process.env.PORT || 3000;
