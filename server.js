@@ -6,7 +6,8 @@ const { createClient } = require('@supabase/supabase-js');
 const cors = require('cors');
 const path = require('path');
 const bcrypt = require('bcryptjs');
-const crypto = require('crypto'); // 🟢 Requis pour générer des jetons cryptographiques
+const crypto = require('crypto');
+const nodemailer = require('nodemailer'); // ✉️ Ajouté pour l'envoi d'e-mails (inspiré de server_5.js)
 require('dotenv').config();
 
 const serviceAccount = require('./serviceAccountKey.json');
@@ -27,6 +28,22 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 const app = express();
 
 // ==========================================
+// ✉️ CONFIGURATION DU TRANSPORTEUR SMTP (BREVO / NODEMAILER)
+// ==========================================
+const transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST || 'smtp-relay.brevo.com',
+    port: Number(process.env.SMTP_PORT) || 587,
+    secure: false,
+    auth: {
+        user: process.env.SMTP_USER || 'baa4d9001@smtp-brevo.com',
+        pass: process.env.BREVO_SMTP_PASS
+    },
+    tls: {
+        rejectUnauthorized: false
+    }
+});
+
+// ==========================================
 // GESTION DYNAMIQUE DE L'ENVIRONNEMENT (PROD / LOCAL)
 // ==========================================
 const isProduction = process.env.NODE_ENV === 'production';
@@ -36,7 +53,6 @@ const allowedOrigins = [
     'http://127.0.0.1:3000',
     'https://thepulse-9vi1.onrender.com',
     'https://thepulse.centillion.online'
-
 ];
 
 app.use(cors({
@@ -71,10 +87,9 @@ function generateHotelID(hotelName) {
 }
 
 // ==========================================
-// 🟢 NOUVELLES ROUTES : SÉCURITÉ PAIEMENT KKIAPAY
+// 🟢 ROUTES : SÉCURITÉ PAIEMENT KKIAPAY
 // ==========================================
 
-// 1. Valider une transaction Kkiapay et générer un jeton temporaire d'inscription
 app.post('/api/verify-kkiapay', async (req, res) => {
     try {
         const { transactionId } = req.body;
@@ -82,10 +97,8 @@ app.post('/api/verify-kkiapay', async (req, res) => {
             return res.status(400).json({ success: false, message: "ID de transaction requis." });
         }
 
-        // Génération d'un jeton unique sécurisé
         const paymentToken = crypto.randomBytes(32).toString('hex');
         
-        // Enregistrement dans Firestore (utilisable une seule fois)
         await db.collection('valid_payments').doc(paymentToken).set({
             transactionId: transactionId,
             used: false,
@@ -99,7 +112,6 @@ app.post('/api/verify-kkiapay', async (req, res) => {
     }
 });
 
-// 2. Vérifier et consommer le jeton lors de la validation de l'inscription
 app.post('/api/verify-payment-token', async (req, res) => {
     try {
         const { token } = req.body;
@@ -114,7 +126,6 @@ app.post('/api/verify-payment-token', async (req, res) => {
             return res.json({ valid: false });
         }
 
-        // Marquer le jeton comme consommé
         await docRef.update({ used: true });
 
         res.json({ valid: true });
@@ -238,6 +249,157 @@ app.post('/api/verify-hotel', async (req, res) => {
 });
 
 // ==========================================
+// 🔑 GESTION DU MOT DE PASSE OUBLIÉ & RÉINITIALISATION
+// ==========================================
+
+// A. Vérifier si l'e-mail existe et renvoyer dynamiquement l'hôtel associé
+app.post('/api/auth/check-email', async (req, res) => {
+    try {
+        const { email } = req.body;
+        if (!email) {
+            return res.status(400).json({ success: false, message: "E-mail requis." });
+        }
+
+        const cleanEmail = email.trim().toLowerCase();
+        const hotelsSnapshot = await db.collection('hotels').get();
+        let foundHotelId = null;
+
+        for (const hotelDoc of hotelsSnapshot.docs) {
+            const hotelId = hotelDoc.id;
+            const userDocRef = db.collection('hotels').doc(hotelId).collection('users').doc(cleanEmail);
+            const userDocSnap = await userDocRef.get();
+
+            if (userDocSnap.exists) {
+                foundHotelId = hotelId;
+                break;
+            }
+        }
+
+        if (!foundHotelId) {
+            return res.status(404).json({ success: false, message: "Aucun compte associé à cet e-mail." });
+        }
+
+        res.json({ success: true, hotelName: foundHotelId });
+    } catch (error) {
+        console.error("Erreur Check Email :", error);
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// B. Envoyer le lien de réinitialisation (Jeton valable exactement 5 minutes)
+app.post('/api/auth/forgot-password', async (req, res) => {
+    try {
+        const { email } = req.body;
+        if (!email) {
+            return res.status(400).json({ success: false, message: "E-mail requis." });
+        }
+
+        const cleanEmail = email.trim().toLowerCase();
+        const hotelsSnapshot = await db.collection('hotels').get();
+        let foundHotelId = null;
+
+        for (const hotelDoc of hotelsSnapshot.docs) {
+            const hotelId = hotelDoc.id;
+            const userDocSnap = await db.collection('hotels').doc(hotelId).collection('users').doc(cleanEmail).get();
+            if (userDocSnap.exists) {
+                foundHotelId = hotelId;
+                break;
+            }
+        }
+
+        if (!foundHotelId) {
+            return res.status(404).json({ success: false, message: "E-mail introuvable." });
+        }
+
+        // Génération d'un jeton sécurisé et expiration réglée à 5 minutes
+        const resetToken = crypto.randomBytes(32).toString('hex');
+        const expiresAt = Date.now() + (5 * 60 * 1000); // 5 minutes
+
+        // Stockage du jeton dans Firestore
+        await db.collection('password_resets').doc(resetToken).set({
+            email: cleanEmail,
+            hotelId: foundHotelId,
+            expiresAt: expiresAt,
+            used: false,
+            createdAt: Date.now()
+        });
+
+        const frontendBaseUrl = (req.headers.origin || req.headers.referer || '').includes('centillion.online') 
+            ? 'https://thepulse.centillion.online' 
+            : 'http://localhost:3000';
+
+        const resetLink = `${frontendBaseUrl}/reset-password.html?token=${resetToken}`;
+
+        // Envoi de l'e-mail via Brevo / SMTP (Inspiré de server_5.js)
+        await transporter.sendMail({
+            from: `"The Pulse" <noreply@centillion.online>`,
+            to: cleanEmail,
+            subject: 'Réinitialisation de votre mot de passe - The Pulse',
+            html: `
+                <div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; border: 1px solid #e2e8f0; border-radius: 12px; background-color: #ffffff; overflow: hidden; padding: 25px;">
+                    <h2 style="color: #d17634; font-family: Cinzel, serif;">THE PULSE</h2>
+                    <p>Vous avez demandé la réinitialisation de votre mot de passe pour votre établissement <strong>${foundHotelId}</strong>.</p>
+                    <p>Cliquez sur le bouton ci-dessous pour définir un nouveau mot de passe. <strong>Ce lien expirera dans 5 minutes.</strong></p>
+                    <div style="text-align: center; margin: 30px 0;">
+                        <a href="${resetLink}" style="background-color: #111111; color: white; padding: 14px 28px; text-decoration: none; border-radius: 8px; font-weight: bold; display: inline-block;">Réinitialiser mon mot de passe</a>
+                    </div>
+                    <p style="color: #666; font-size: 13px;">Si vous n'êtes pas à l'origine de cette demande, vous pouvez ignorer cet e-mail en toute sécurité.</p>
+                </div>
+            `,
+            textContent: `The Pulse - Réinitialisation de mot de passe\n\nCliquez sur ce lien pour réinitialiser votre mot de passe (valide 5 minutes) :\n${resetLink}`
+        });
+
+        res.json({ success: true, message: "E-mail de réinitialisation envoyé avec succès." });
+    } catch (error) {
+        console.error("Erreur Forgot Password :", error);
+        res.status(500).json({ success: false, message: "Erreur lors de l'envoi de l'e-mail." });
+    }
+});
+
+// C. Valider le jeton, vérifier l'expiration (5 min) et mettre à jour le mot de passe hashé
+app.post('/api/auth/reset-password', async (req, res) => {
+    try {
+        const { token, newPassword } = req.body;
+        if (!token || !newPassword) {
+            return res.status(400).json({ success: false, message: "Données manquantes." });
+        }
+
+        const tokenRef = db.collection('password_resets').doc(token);
+        const tokenSnap = await tokenRef.get();
+
+        if (!tokenSnap.exists) {
+            return res.status(400).json({ success: false, message: "Lien invalide ou expiré." });
+        }
+
+        const tokenData = tokenSnap.data();
+
+        // Vérification stricte de l'expiration (5 minutes) et de l'utilisation unique
+        if (tokenData.used || Date.now() > tokenData.expiresAt) {
+            return res.status(400).json({ success: false, message: "Ce lien a expiré (délai de 5 minutes dépassé) ou a déjà été utilisé." });
+        }
+
+        // Hashage du nouveau mot de passe via bcrypt
+        const salt = await bcrypt.genSalt(10);
+        const hashedPassword = await bcrypt.hash(newPassword, salt);
+
+        // Mise à jour du mot de passe dans l'arborescence Firestore de l'hôtel
+        const userDocRef = db.collection('hotels').doc(tokenData.hotelId).collection('users').doc(tokenData.email);
+        await userDocRef.update({
+            password: hashedPassword,
+            updatedAt: Date.now()
+        });
+
+        // Consommer le jeton pour qu'il ne soit plus réutilisable
+        await tokenRef.update({ used: true });
+
+        res.json({ success: true, message: "Mot de passe mis à jour avec succès." });
+    } catch (error) {
+        console.error("Erreur Reset Password :", error);
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// ==========================================
 // 2. ROUTES GESTION DES TOTEMS
 // ==========================================
 app.get('/api/hotels/:uid/totems', async (req, res) => {
@@ -293,7 +455,6 @@ app.post('/api/hotels/:uid/totems', async (req, res) => {
         
         await totemRef.set(totemData, { merge: true });
 
-        // 🟢 NOTIFICATION SSE EN TEMPS RÉEL
         notifyTotems(uid);
 
         res.json({ success: true, message: 'Totem ajouté avec succès', id: totemId, totem: totemData });
@@ -344,7 +505,6 @@ app.delete('/api/hotels/:uid/totems/:totemId', async (req, res) => {
 
         await totemRef.delete();
 
-        // 🟢 NOTIFICATION SSE EN TEMPS RÉEL
         notifyTotems(uid);
 
         res.json({ success: true, message: 'Totem et médias associés supprimés avec succès.' });
@@ -400,7 +560,6 @@ app.post('/api/hotels/:uid/media/:totemName', async (req, res) => {
             }
         }, { merge: true });
 
-        // 🟢 NOTIFICATION SSE EN TEMPS RÉEL
         notifyTotems(uid);
 
         res.json({ success: true, message: 'Média enregistré avec succès.', mediaId });
@@ -427,7 +586,6 @@ app.delete('/api/hotels/:uid/media/:totemName/:mediaId', async (req, res) => {
         const mediaData = totemData[mediaId];
 
         if (!mediaData || !mediaData.url) {
-            console.error(`❌ [DELETE] Aucune URL trouvée pour le média ${mediaId} dans Firestore !`);
             return res.status(400).json({ success: false, error: "URL du média introuvable dans Firestore." });
         }
 
@@ -440,24 +598,19 @@ app.delete('/api/hotels/:uid/media/:totemName/:mediaId', async (req, res) => {
         }
 
         const decodedFileName = decodeURIComponent(fileName);
-        console.log(`🚀 [SUPABASE] Suppression physique demandée pour : "${decodedFileName}"`);
 
         const { data, error: supabaseError } = await supabase.storage
             .from('media')
             .remove([decodedFileName]);
 
         if (supabaseError) {
-            console.error("❌ [SUPABASE ERROR] :", supabaseError);
             return res.status(500).json({ success: false, error: "Erreur Supabase: " + supabaseError.message });
         }
-
-        console.log("✅ [SUPABASE SUCCESS] Fichier effacé du bucket :", data);
 
         await totemDocRef.update({
             [mediaId]: FieldValue.delete()
         });
         
-        // 🟢 NOTIFICATION SSE EN TEMPS RÉEL
         notifyTotems(uid);
 
         res.json({ success: true, message: 'Média supprimé avec succès de Supabase et Firestore.' });
@@ -494,7 +647,6 @@ app.put('/api/hotels/:uid/media/order', async (req, res) => {
 
         await batch.commit();
 
-        // 🟢 NOTIFICATION SSE EN TEMPS RÉEL
         notifyTotems(uid);
 
         res.json({ success: true, message: "Ordre mis à jour avec succès." });
@@ -635,17 +787,10 @@ app.delete('/api/hotels/:uid/worldwide/products/:productId', async (req, res) =>
                     
                     if (fileName) {
                         const filePathInBucket = `${decodeURIComponent(folderName)}/${decodeURIComponent(fileName)}`;
-                        console.log(`🚀 [SUPABASE] Suppression physique demandée pour le fichier : "${filePathInBucket}"`);
                         
-                        const { data, error: supabaseError } = await supabase.storage
+                        await supabase.storage
                             .from('media')
                             .remove([filePathInBucket]);
-
-                        if (supabaseError) {
-                            console.error("❌ [SUPABASE ERROR] :", supabaseError);
-                        } else {
-                            console.log("✅ [SUPABASE SUCCESS] Fichier effacé du bucket :", data);
-                        }
                     }
                 } catch (storageErr) {
                     console.error("Erreur suppression image Supabase:", storageErr);
@@ -693,7 +838,7 @@ app.post('/api/hotels/:uid/worldwide/config', async (req, res) => {
 // ==========================================
 // ROUTE SSE (Server-Sent Events) pour les Totems
 // ==========================================
-let totemClients = {}; // Stocke les connexions des totems par hôtel
+let totemClients = {};
 
 app.get('/api/hotels/:uid/events', (req, res) => {
     const { uid } = req.params;
@@ -708,13 +853,11 @@ app.get('/api/hotels/:uid/events', (req, res) => {
     }
     totemClients[uid].push(res);
 
-    // Si le client se déconnecte, on le retire de la liste
     req.on('close', () => {
         totemClients[uid] = totemClients[uid].filter(client => client !== res);
     });
 });
 
-// Fonction utilitaire pour notifier tous les totems d'un hôtel
 function notifyTotems(uid) {
     if (totemClients[uid]) {
         totemClients[uid].forEach(client => {
