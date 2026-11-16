@@ -286,7 +286,7 @@ app.post('/api/auth/check-email', async (req, res) => {
     }
 });
 
-// B. Envoyer le lien de réinitialisation (Jeton valable exactement 5 minutes)
+// B. Envoyer le lien de réinitialisation via l'API HTTP de Brevo (Port 443 - Jamais bloqué par Render)
 app.post('/api/auth/forgot-password', async (req, res) => {
     try {
         const { email } = req.body;
@@ -311,11 +311,10 @@ app.post('/api/auth/forgot-password', async (req, res) => {
             return res.status(404).json({ success: false, message: "E-mail introuvable." });
         }
 
-        // Génération d'un jeton sécurisé et expiration réglée à 5 minutes
+        // Génération du jeton sécurisé (valable 5 minutes)
         const resetToken = crypto.randomBytes(32).toString('hex');
-        const expiresAt = Date.now() + (5 * 60 * 1000); // 5 minutes
+        const expiresAt = Date.now() + (5 * 60 * 1000);
 
-        // Stockage du jeton dans Firestore
         await db.collection('password_resets').doc(resetToken).set({
             email: cleanEmail,
             hotelId: foundHotelId,
@@ -330,24 +329,39 @@ app.post('/api/auth/forgot-password', async (req, res) => {
 
         const resetLink = `${frontendBaseUrl}/reset-password.html?token=${resetToken}`;
 
-        // Envoi de l'e-mail via Brevo / SMTP (Inspiré de server_5.js)
-        await transporter.sendMail({
-            from: `"The Pulse" <noreply@centillion.online>`,
-            to: cleanEmail,
-            subject: 'Réinitialisation de votre mot de passe - The Pulse',
-            html: `
-                <div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; border: 1px solid #e2e8f0; border-radius: 12px; background-color: #ffffff; overflow: hidden; padding: 25px;">
-                    <h2 style="color: #d17634; font-family: Cinzel, serif;">THE PULSE</h2>
-                    <p>Vous avez demandé la réinitialisation de votre mot de passe pour votre établissement <strong>${foundHotelId}</strong>.</p>
-                    <p>Cliquez sur le bouton ci-dessous pour définir un nouveau mot de passe. <strong>Ce lien expirera dans 5 minutes.</strong></p>
-                    <div style="text-align: center; margin: 30px 0;">
-                        <a href="${resetLink}" style="background-color: #111111; color: white; padding: 14px 28px; text-decoration: none; border-radius: 8px; font-weight: bold; display: inline-block;">Réinitialiser mon mot de passe</a>
+        // 🚀 Envoi via l'API HTTP Brevo (HTTPS - Passe partout en prod sur Render)
+        const brevoResponse = await fetch('https://api.brevo.com/v3/smtp/email', {
+            method: 'POST',
+            headers: {
+                'accept': 'application/json',
+                'api-key': process.env.BREVO_SMTP_PASS, // Ta clé API / SMTP Brevo
+                'content-type': 'application/json'
+            },
+            body: JSON.stringify({
+                sender: { name: "The Pulse", email: "noreply@centillion.online" },
+                to: [{ email: cleanEmail }],
+                subject: 'Réinitialisation de votre mot de passe - The Pulse',
+                htmlContent: `
+                    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; border: 1px solid #e2e8f0; border-radius: 12px; background-color: #ffffff; overflow: hidden; padding: 25px;">
+                        <h2 style="color: #d17634; font-family: Cinzel, serif;">THE PULSE</h2>
+                        <p>Vous avez demandé la réinitialisation de votre mot de passe pour votre établissement <strong>${foundHotelId}</strong>.</p>
+                        <p>Cliquez sur le bouton ci-dessous pour définir un nouveau mot de passe. <strong>Ce lien expirera dans 5 minutes.</strong></p>
+                        <div style="text-align: center; margin: 30px 0;">
+                            <a href="${resetLink}" style="background-color: #111111; color: white; padding: 14px 28px; text-decoration: none; border-radius: 8px; font-weight: bold; display: inline-block;">Réinitialiser mon mot de passe</a>
+                        </div>
+                        <p style="color: #666; font-size: 13px;">Si vous n'êtes pas à l'origine de cette demande, vous pouvez ignorer cet e-mail en toute sécurité.</p>
                     </div>
-                    <p style="color: #666; font-size: 13px;">Si vous n'êtes pas à l'origine de cette demande, vous pouvez ignorer cet e-mail en toute sécurité.</p>
-                </div>
-            `,
-            textContent: `The Pulse - Réinitialisation de mot de passe\n\nCliquez sur ce lien pour réinitialiser votre mot de passe (valide 5 minutes) :\n${resetLink}`
+                `,
+                textContent: `The Pulse - Réinitialisation de mot de passe\n\nCliquez sur ce lien pour réinitialiser votre mot de passe (valide 5 minutes) :\n${resetLink}`
+            })
         });
+
+        const brevoData = await brevoResponse.json();
+
+        if (!brevoResponse.ok) {
+            console.error("Erreur API Brevo:", brevoData);
+            return res.status(500).json({ success: false, message: "Erreur lors de l'envoi de l'e-mail via Brevo." });
+        }
 
         res.json({ success: true, message: "E-mail de réinitialisation envoyé avec succès." });
     } catch (error) {
