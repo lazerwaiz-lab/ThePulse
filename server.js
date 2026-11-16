@@ -7,7 +7,7 @@ const cors = require('cors');
 const path = require('path');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
-const nodemailer = require('nodemailer'); // ✉️ Ajouté pour l'envoi d'e-mails (inspiré de server_5.js)
+const nodemailer = require('nodemailer');
 require('dotenv').config();
 
 const serviceAccount = require('./serviceAccountKey.json');
@@ -28,20 +28,71 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 const app = express();
 
 // ==========================================
-// ✉️ CONFIGURATION DU TRANSPORTEUR SMTP (BREVO / NODEMAILER)
+// ✉️ FONCTION UTILITAIRE UNIFIÉE : DESIGN STYLE BREVO (LOGO EN CERCLE BLANC)
 // ==========================================
-const transporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST || 'smtp-relay.brevo.com',
-    port: Number(process.env.SMTP_PORT) || 587,
-    secure: false,
-    auth: {
-        user: process.env.SMTP_USER || 'baa4d9001@smtp-brevo.com',
-        pass: process.env.BREVO_SMTP_PASS
-    },
-    tls: {
-        rejectUnauthorized: false
+async function sendThePulseEmail(toEmail, subject, mainContentHtml) {
+    const logoUrl = "https://thepulse.centillion.online/THE%20PULSE_onglet.png"; 
+
+    const htmlContent = `
+        <div style="font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; background-color: #fdf6f0; padding: 40px 20px; width: 100%; box-sizing: border-box;">
+            <div style="max-width: 500px; margin: auto; background-color: #ffffff; border-radius: 12px; padding: 40px 30px; box-shadow: 0 4px 15px rgba(0,0,0,0.03); border: 1px solid #fae8d8;">
+                
+                <!-- LOGO DANS UN CERCLE BLANC ET NOM (STYLE BREVO) -->
+                <div style="text-align: center; margin-bottom: 25px;">
+                    <div style="width: 64px; height: 64px; background-color: #ffffff; border-radius: 50%; text-align: center; line-height: 64px; margin: 0 auto 12px auto; box-shadow: 0 3px 10px rgba(209, 118, 52, 0.1); border: 1px solid #fae8d8; display: inline-block;">
+                        <img src="${logoUrl}" alt="The Pulse" width="52" height="52" style="vertical-align: middle; border-radius: 50%; object-fit: contain;" />
+                    </div>
+                    <div style="font-family: Cinzel, serif; font-size: 16px; font-weight: bold; color: #d17634; letter-spacing: 2px;">THE PULSE</div>
+                </div>
+
+                <!-- OBJET DU MESSAGE -->
+                <div style="text-align: center; margin-bottom: 30px;">
+                    <h2 style="font-size: 18px; font-weight: bold; color: #111111; margin: 0; letter-spacing: 0.5px;">${subject}</h2>
+                </div>
+
+                <!-- CONTENU PRINCIPAL -->
+                <div style="color: #333333; font-size: 15px; line-height: 1.6; text-align: left;">
+                    ${mainContentHtml}
+                </div>
+
+                <!-- SÉPARATEUR FIN -->
+                <hr style="border: none; border-top: 1px solid #eee; margin: 35px 0 25px 0;" />
+
+                <!-- PIED DE PAGE -->
+                <div style="text-align: center; font-size: 12px; color: #888888; line-height: 1.5;">
+                    <p style="margin: 0 0 8px 0;">Si vous n'êtes pas à l'origine de cette demande, vous pouvez ignorer cet e-mail en toute sécurité.</p>
+                    <p style="margin: 0; font-weight: bold; color: #111111; letter-spacing: 1px;">The Pulse • Centillion.Online</p>
+                </div>
+
+            </div>
+        </div>
+    `;
+
+    try {
+        const brevoResponse = await fetch('https://api.brevo.com/v3/smtp/email', {
+            method: 'POST',
+            headers: {
+                'accept': 'application/json',
+                'api-key': process.env.BREVO_SMTP_PASS,
+                'content-type': 'application/json'
+            },
+            body: JSON.stringify({
+                sender: { name: "The Pulse", email: "noreply@centillion.online" },
+                to: [{ email: toEmail }],
+                subject: `The Pulse - ${subject}`,
+                htmlContent: htmlContent,
+                textContent: `The Pulse - ${subject}\n\n${mainContentHtml.replace(/<[^>]*>/g, '')}\n\nThe Pulse • Centillion.Online`
+            })
+        });
+
+        const brevoData = await brevoResponse.json();
+        if (!brevoResponse.ok) {
+            console.error("Erreur API Brevo:", brevoData);
+        }
+    } catch (err) {
+        console.error("Erreur lors de l'envoi de l'e-mail:", err);
     }
-});
+}
 
 // ==========================================
 // GESTION DYNAMIQUE DE L'ENVIRONNEMENT (PROD / LOCAL)
@@ -182,6 +233,21 @@ app.post('/api/signup', async (req, res) => {
             createdAt: now
         }, { merge: true });
 
+        // ✉️ Envoi de l'e-mail de bienvenue unifié (Bouton orange)
+        await sendThePulseEmail(
+            email,
+            "Bienvenue sur The Pulse",
+            `
+            <p>Bonjour,</p>
+            <p>Votre compte pour l'établissement <strong>${cleanHotelName}</strong> a été créé avec succès sur l'écosystème <strong>The Pulse</strong>.</p>
+            <p>Votre identifiant unique d'établissement est : <code style="background: #f1f5f9; padding: 4px 8px; border-radius: 4px; font-weight: bold; color: #d17634;">${hotelID}</code></p>
+            <p>Vous pouvez dès à présent vous connecter pour configurer vos totems et piloter vos contenus en temps réel.</p>
+            <div style="text-align: center; margin: 30px 0;">
+                <a href="https://thepulse.centillion.online/index.html" style="background-color: #d17634; color: white; padding: 14px 28px; text-decoration: none; border-radius: 8px; font-weight: bold; display: inline-block;">Accéder à mon espace</a>
+            </div>
+            `
+        );
+
         res.json({ 
             success: true, 
             message: 'Hôtel, utilisateur et abonnement initialisés avec succès par le serveur.', 
@@ -235,6 +301,17 @@ app.post('/api/verify-hotel', async (req, res) => {
         if (!isPasswordValid) {
             return res.status(401).json({ success: false, message: 'Mot de passe incorrect.' });
         }
+
+        // ✉️ Envoi de l'e-mail de notification de connexion unifié
+        await sendThePulseEmail(
+            email,
+            "Nouvelle connexion à votre espace",
+            `
+            <p>Bonjour,</p>
+            <p>Une connexion réussie a été enregistrée pour votre établissement <strong>${foundHotelId}</strong>.</p>
+            <p>Si vous êtes à l'origine de cette action, aucune action n'est requise.</p>
+            `
+        );
 
         res.json({ 
             success: true, 
@@ -311,9 +388,9 @@ app.post('/api/auth/forgot-password', async (req, res) => {
             return res.status(404).json({ success: false, message: "E-mail introuvable." });
         }
 
-        // Génération du jeton sécurisé (valable 5 minutes)
+        // Génération du jeton sécurisé (valable 30 minutes)
         const resetToken = crypto.randomBytes(32).toString('hex');
-        const expiresAt = Date.now() + (5 * 60 * 1000);
+        const expiresAt = Date.now() + (30 * 60 * 1000);
 
         await db.collection('password_resets').doc(resetToken).set({
             email: cleanEmail,
@@ -329,39 +406,16 @@ app.post('/api/auth/forgot-password', async (req, res) => {
 
         const resetLink = `${frontendBaseUrl}/reset-password.html?token=${resetToken}`;
 
-        // 🚀 Envoi via l'API HTTP Brevo (HTTPS - Passe partout en prod sur Render)
-        const brevoResponse = await fetch('https://api.brevo.com/v3/smtp/email', {
-            method: 'POST',
-            headers: {
-                'accept': 'application/json',
-                'api-key': process.env.BREVO_SMTP_PASS, // Ta clé API / SMTP Brevo
-                'content-type': 'application/json'
-            },
-            body: JSON.stringify({
-                sender: { name: "The Pulse", email: "noreply@centillion.online" },
-                to: [{ email: cleanEmail }],
-                subject: 'Réinitialisation de votre mot de passe - The Pulse',
-                htmlContent: `
-                    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; border: 1px solid #e2e8f0; border-radius: 12px; background-color: #ffffff; overflow: hidden; padding: 25px;">
-                        <h2 style="color: #d17634; font-family: Cinzel, serif;">THE PULSE</h2>
-                        <p>Vous avez demandé la réinitialisation de votre mot de passe pour votre établissement <strong>${foundHotelId}</strong>.</p>
-                        <p>Cliquez sur le bouton ci-dessous pour définir un nouveau mot de passe. <strong>Ce lien expirera dans 5 minutes.</strong></p>
-                        <div style="text-align: center; margin: 30px 0;">
-                            <a href="${resetLink}" style="background-color: #111111; color: white; padding: 14px 28px; text-decoration: none; border-radius: 8px; font-weight: bold; display: inline-block;">Réinitialiser mon mot de passe</a>
-                        </div>
-                        <p style="color: #666; font-size: 13px;">Si vous n'êtes pas à l'origine de cette demande, vous pouvez ignorer cet e-mail en toute sécurité.</p>
-                    </div>
-                `,
-                textContent: `The Pulse - Réinitialisation de mot de passe\n\nCliquez sur ce lien pour réinitialiser votre mot de passe (valide 5 minutes) :\n${resetLink}`
-            })
-        });
-
-        const brevoData = await brevoResponse.json();
-
-        if (!brevoResponse.ok) {
-            console.error("Erreur API Brevo:", brevoData);
-            return res.status(500).json({ success: false, message: "Erreur lors de l'envoi de l'e-mail via Brevo." });
-        }
+        // 🚀 Envoi de l'e-mail via la fonction unifiée (Bouton orange)
+        const subject = "Réinitialisation de mot de passe";
+        const mainContent = `
+            <p>Vous avez demandé la réinitialisation de votre mot de passe pour votre établissement <strong>${foundHotelId}</strong>.</p>
+            <p>Cliquez sur le bouton ci-dessous pour définir un nouveau mot de passe. <strong>Ce lien expirera dans 30 minutes.</strong></p>
+            <div style="text-align: center; margin: 30px 0;">
+                <a href="${resetLink}" style="background-color: #d17634; color: white; padding: 14px 28px; text-decoration: none; border-radius: 8px; font-weight: bold; display: inline-block;">Réinitialiser mon mot de passe</a>
+            </div>
+        `;
+        await sendThePulseEmail(cleanEmail, subject, mainContent);
 
         res.json({ success: true, message: "E-mail de réinitialisation envoyé avec succès." });
     } catch (error) {
@@ -387,9 +441,9 @@ app.post('/api/auth/reset-password', async (req, res) => {
 
         const tokenData = tokenSnap.data();
 
-        // Vérification stricte de l'expiration (5 minutes) et de l'utilisation unique
+        // Vérification stricte de l'expiration (30 minutes) et de l'utilisation unique
         if (tokenData.used || Date.now() > tokenData.expiresAt) {
-            return res.status(400).json({ success: false, message: "Ce lien a expiré (délai de 5 minutes dépassé) ou a déjà été utilisé." });
+            return res.status(400).json({ success: false, message: "Ce lien a expiré ou a déjà été utilisé." });
         }
 
         // Hashage du nouveau mot de passe via bcrypt
