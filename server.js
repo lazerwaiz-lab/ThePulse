@@ -1,941 +1,487 @@
+require('dotenv').config();
 const express = require('express');
-const admin = require('firebase-admin');
-const { initializeApp, cert } = require('firebase-admin/app');
-const { getFirestore } = require('firebase-admin/firestore');
-const { createClient } = require('@supabase/supabase-js');
 const cors = require('cors');
 const path = require('path');
-const bcrypt = require('bcryptjs');
-const crypto = require('crypto');
-const nodemailer = require('nodemailer');
-require('dotenv').config();
+const multer = require('multer'); // <--- Indispensable pour l'upload
+const { createClient } = require('@supabase/supabase-js'); // <--- Indispensable pour Supabase
+const { initializeApp, cert } = require('firebase-admin/app');
+const { getFirestore } = require('firebase-admin/firestore');
 
-const serviceAccount = require('./serviceAccountKey.json');
+// Chargement sécurisé de Firebase (Compatible Local et Render)
+let serviceAccount;
+if (process.env.FIREBASE_PRIVATE_KEY) {
+    serviceAccount = {
+        type: "service_account",
+        project_id: process.env.FIREBASE_PROJECT_ID || "sap-sofitel",
+        private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
+        private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+        client_email: process.env.FIREBASE_CLIENT_EMAIL,
+        client_id: process.env.FIREBASE_CLIENT_ID,
+        auth_uri: "https://accounts.google.com/o/oauth2/auth",
+        token_uri: "https://oauth2.googleapis.com/token",
+        auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
+        client_x509_cert_url: process.env.FIREBASE_CLIENT_X509_CERT_URL,
+        universe_domain: "googleapis.com"
+    };
+} else {
+    serviceAccount = require('./serviceAccountKey.json');
+}
 
-// Initialisation modulaire correcte de Firebase
 initializeApp({
-  credential: cert(serviceAccount)
+    credential: cert(serviceAccount)
 });
 
-// Initialisation de Firestore et Supabase
 const db = getFirestore();
-
-// 🟢 Initialisation du client Supabase
-const supabaseUrl = 'https://wogcnzukwoekalnkwied.supabase.co';
-const supabaseKey = process.env.SUPABASE_SECRET_KEY;
-const supabase = createClient(supabaseUrl, supabaseKey);
-
 const app = express();
 
-// ==========================================
-// ✉️ FONCTION UTILITAIRE UNIFIÉE : DESIGN STYLE BREVO (LOGO EN CERCLE BLANC)
-// ==========================================
-async function sendThePulseEmail(toEmail, subject, mainContentHtml) {
-    const logoUrl = "https://thepulse.centillion.online/THE%20PULSE_onglet.png"; 
-
-    const htmlContent = `
-        <div style="font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; background-color: #fdf6f0; padding: 40px 20px; width: 100%; box-sizing: border-box;">
-            <div style="max-width: 500px; margin: auto; background-color: #ffffff; border-radius: 12px; padding: 40px 30px; box-shadow: 0 4px 15px rgba(0,0,0,0.03); border: 1px solid #fae8d8;">
-                
-                <!-- LOGO DANS UN CERCLE BLANC ET NOM (STYLE BREVO) -->
-                <div style="text-align: center; margin-bottom: 25px;">
-                    <div style="width: 64px; height: 64px; background-color: #ffffff; border-radius: 50%; text-align: center; line-height: 64px; margin: 0 auto 12px auto; box-shadow: 0 3px 10px rgba(209, 118, 52, 0.1); border: 1px solid #fae8d8; display: inline-block;">
-                        <img src="${logoUrl}" alt="The Pulse" width="52" height="52" style="vertical-align: middle; border-radius: 50%; object-fit: contain;" />
-                    </div>
-                    <div style="font-family: Cinzel, serif; font-size: 16px; font-weight: bold; color: #d17634; letter-spacing: 2px;">THE PULSE</div>
-                </div>
-
-                <!-- OBJET DU MESSAGE -->
-                <div style="text-align: center; margin-bottom: 30px;">
-                    <h2 style="font-size: 18px; font-weight: bold; color: #111111; margin: 0; letter-spacing: 0.5px;">${subject}</h2>
-                </div>
-
-                <!-- CONTENU PRINCIPAL -->
-                <div style="color: #333333; font-size: 15px; line-height: 1.6; text-align: left;">
-                    ${mainContentHtml}
-                </div>
-
-                <!-- SÉPARATEUR FIN -->
-                <hr style="border: none; border-top: 1px solid #eee; margin: 35px 0 25px 0;" />
-
-                <!-- PIED DE PAGE -->
-                <div style="text-align: center; font-size: 12px; color: #888888; line-height: 1.5;">
-                    <p style="margin: 0 0 8px 0;">Si vous n'êtes pas à l'origine de cette demande, vous pouvez ignorer cet e-mail en toute sécurité.</p>
-                    <p style="margin: 0; font-weight: bold; color: #111111; letter-spacing: 1px;">The Pulse • Centillion.Online</p>
-                </div>
-
-            </div>
-        </div>
-    `;
-
-    try {
-        const brevoResponse = await fetch('https://api.brevo.com/v3/smtp/email', {
-            method: 'POST',
-            headers: {
-                'accept': 'application/json',
-                'api-key': process.env.BREVO_SMTP_PASS,
-                'content-type': 'application/json'
-            },
-            body: JSON.stringify({
-                sender: { name: "The Pulse", email: "noreply@centillion.online" },
-                to: [{ email: toEmail }],
-                subject: `The Pulse - ${subject}`,
-                htmlContent: htmlContent,
-                textContent: `The Pulse - ${subject}\n\n${mainContentHtml.replace(/<[^>]*>/g, '')}\n\nThe Pulse • Centillion.Online`
-            })
-        });
-
-        const brevoData = await brevoResponse.json();
-        if (!brevoResponse.ok) {
-            console.error("Erreur API Brevo:", brevoData);
-        }
-    } catch (err) {
-        console.error("Erreur lors de l'envoi de l'e-mail:", err);
-    }
-}
-
-// ==========================================
-// GESTION DYNAMIQUE DE L'ENVIRONNEMENT (PROD / LOCAL)
-// ==========================================
-const isProduction = process.env.NODE_ENV === 'production';
-
-const allowedOrigins = [
-    'http://localhost:3000',
-    'http://127.0.0.1:3000',
-    'https://thepulse-9vi1.onrender.com',
-    'https://thepulse.centillion.online'
-];
-
-app.use(cors({
-    origin: function (origin, callback) {
-        if (!origin && !isProduction) return callback(null, true);
-        if (allowedOrigins.indexOf(origin) === -1 && isProduction) {
-            return callback(new Error('Bloqué par la politique CORS (Production)'), false);
-        }
-        return callback(null, true);
-    },
-    credentials: true
-}));
-
-// Middlewares globaux
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
+app.use(cors());
 app.use(express.static(path.join(__dirname)));
 
-// ==========================================
-// FONCTION UTILITAIRE : Génération du hotelID unique
-// ==========================================
-function generateHotelID(hotelName) {
-    const cleanName = hotelName ? hotelName.replace(/[^a-zA-Z]/g, '').toUpperCase() : 'HOT';
-    const prefix = cleanName.substring(0, 3).padEnd(3, 'X');
-    const upperChar = String.fromCharCode(65 + Math.floor(Math.random() * 26));
-    const lowerChar = String.fromCharCode(97 + Math.floor(Math.random() * 26));
-    const digits = Math.floor(100 + Math.random() * 900);
-    const randomLowerString = Array.from({ length: 3 }, () => 
-        String.fromCharCode(97 + Math.floor(Math.random() * 26))
-    ).join('');
+// Configuration de Multer (mémoire tampon)
+const upload = multer({ storage: multer.memoryStorage() });
 
-    return `${prefix}-PULSE-${upperChar}${lowerChar}${digits}${randomLowerString}`;
-}
+// Initialisation de Supabase
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+
+// Middleware de vérification d'authentification pour bloquer les écritures non autorisées
+const verifyAuthToken = async (req, res, next) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({ error: "Accès refusé. Token manquant." });
+    }
+    const token = authHeader.split('Bearer ')[1];
+    
+    if (token === "SAP_SECRET_TOKEN_2026") {
+        next();
+    } else {
+        res.status(403).json({ error: "Token invalide." });
+    }
+};
 
 // ==========================================
-// 🟢 ROUTES : SÉCURITÉ PAIEMENT KKIAPAY
+// ROUTE DE VÉRIFICATION DU MOT DE PASSE ADMIN
 // ==========================================
-
-app.post('/api/verify-kkiapay', async (req, res) => {
+app.post('/api/verify-admin', async (req, res) => {
     try {
-        const { transactionId } = req.body;
-        if (!transactionId) {
-            return res.status(400).json({ success: false, message: "ID de transaction requis." });
+        const { password } = req.body;
+        const adminPassword = process.env.ADMIN_PASSWORD;
+
+        if (!adminPassword) {
+            return res.status(500).json({ success: false, message: "Configuration serveur incomplète (mot de passe admin manquant)." });
         }
 
-        const paymentToken = crypto.randomBytes(32).toString('hex');
-        
-        await db.collection('valid_payments').doc(paymentToken).set({
-            transactionId: transactionId,
-            used: false,
-            createdAt: Date.now()
-        });
+        if (password !== adminPassword) {
+            return res.status(401).json({ success: false, message: "Mot de passe administrateur incorrect !" });
+        }
 
-        res.json({ success: true, paymentToken: paymentToken });
+        res.json({ success: true, message: "Mot de passe correct." });
     } catch (error) {
-        console.error("Erreur Verify Kkiapay :", error.message);
-        res.status(500).json({ success: false, message: error.message });
+        console.error("Erreur vérification admin :", error);
+        res.status(500).json({ success: false, message: "Erreur serveur." });
     }
 });
 
-app.post('/api/verify-payment-token', async (req, res) => {
+// ==========================================
+// ROUTE D'ÉCRITURE / MODIFICATION SÉCURISÉE (Staff)
+// Avec anti-doublons stricts et gestion propre du changement de matricule
+// ==========================================
+app.post('/api/staff', verifyAuthToken, async (req, res) => {
     try {
-        const { token } = req.body;
-        if (!token) {
-            return res.json({ valid: false });
+        const { id, force, ...data } = req.body;
+        
+        if (!id) {
+            return res.status(400).json({ success: false, error: "ID de l'employé manquant." });
         }
 
-        const docRef = db.collection('valid_payments').doc(token);
+        const sftIdToCheck = (id || '').trim();
+        const nomToCheck = (data.nom || '').trim().toLowerCase();
+        const prenomToCheck = (data.prenom || '').trim().toLowerCase();
+
+        // 1. Vérification si le matricule exact existe déjà
+        const docRef = db.collection('sofitel_cotonou_staff').doc(id);
         const docSnap = await docRef.get();
 
-        if (!docSnap.exists || docSnap.data().used) {
-            return res.json({ valid: false });
-        }
-
-        await docRef.update({ used: true });
-
-        res.json({ valid: true });
-    } catch (error) {
-        console.error("Erreur Token Check :", error.message);
-        res.status(500).json({ valid: false });
-    }
-});
-
-// ==========================================
-// 1. INSCRIPTION
-// ==========================================
-app.post('/api/signup', async (req, res) => {
-    try {
-        const { hotelName, email, password, planId } = req.body;
-        
-        if (!hotelName || !email || !password) {
-            return res.status(400).json({ success: false, message: 'Tous les champs sont obligatoires.' });
-        }
-
-        const cleanHotelName = hotelName.trim();
-
-        const hotelRef = db.collection('hotels').doc(cleanHotelName);
-        const hotelDoc = await hotelRef.get();
-        if (hotelDoc.exists) {
-            return res.status(400).json({ success: false, message: 'Cet établissement existe déjà.' });
-        }
-
-        const hotelID = generateHotelID(cleanHotelName);
-        const now = Date.now();
-
-        const salt = await bcrypt.genSalt(10);
-        const hashedPassword = await bcrypt.hash(password, salt);
-
-        await hotelRef.set({
-            hotelName: cleanHotelName,
-            hotelID: hotelID,
-            email: email,
-            createdAt: now
-        }, { merge: true });
-
-        const userRef = hotelRef.collection('users').doc(email);
-        await userRef.set({
-            email: email,
-            password: hashedPassword,
-            createdAt: now
-        }, { merge: true });
-
-        const cycleDurationMs = 35 * 24 * 60 * 60 * 1000;
-        const subRef = hotelRef.collection('subscription').doc('current');
-        await subRef.set({
-            type: planId || 'business',
-            subscriptionEnd: now + cycleDurationMs,
-            createdAt: now
-        }, { merge: true });
-
-        // ✉️ Envoi de l'e-mail de bienvenue unifié (Bouton orange)
-        await sendThePulseEmail(
-            email,
-            "Bienvenue sur The Pulse",
-            `
-            <p>Bonjour,</p>
-            <p>Votre compte pour l'établissement <strong>${cleanHotelName}</strong> a été créé avec succès sur l'écosystème <strong>The Pulse</strong>.</p>
-            <p>Votre identifiant unique d'établissement est : <code style="background: #f1f5f9; padding: 4px 8px; border-radius: 4px; font-weight: bold; color: #d17634;">${hotelID}</code></p>
-            <p>Vous pouvez dès à présent vous connecter pour configurer vos totems et piloter vos contenus en temps réel.</p>
-            <div style="text-align: center; margin: 30px 0;">
-                <a href="https://thepulse.centillion.online/index.html" style="background-color: #d17634; color: white; padding: 14px 28px; text-decoration: none; border-radius: 8px; font-weight: bold; display: inline-block;">Accéder à mon espace</a>
-            </div>
-            `
-        );
-
-        res.json({ 
-            success: true, 
-            message: 'Hôtel, utilisateur et abonnement initialisés avec succès par le serveur.', 
-            hotelName: cleanHotelName,
-            hotelID: hotelID 
-        });
-    } catch (error) {
-        console.error("Erreur Signup :", error.message);
-        res.status(500).json({ success: false, message: error.message });
-    }
-});
-
-// ==========================================
-// 1.bis. CONNEXION
-// ==========================================
-app.post('/api/verify-hotel', async (req, res) => {
-    try {
-        const { email, password } = req.body;
-
-        if (!email || !password) {
-            return res.status(400).json({ success: false, message: 'Email et mot de passe requis.' });
-        }
-
-        const hotelsSnapshot = await db.collection('hotels').get();
-
-        if (hotelsSnapshot.empty) {
-            return res.status(404).json({ success: false, message: 'Aucun établissement trouvé dans la base.' });
-        }
-
-        let foundHotelId = null;
-        let userData = null;
-
-        for (const hotelDoc of hotelsSnapshot.docs) {
-            const hotelId = hotelDoc.id;
-            const userDocRef = db.collection('hotels').doc(hotelId).collection('users').doc(email);
-            const userDocSnap = await userDocRef.get();
-
-            if (userDocSnap.exists) {
-                foundHotelId = hotelId;
-                userData = userDocSnap.data();
-                break;
-            }
-        }
-
-        if (!foundHotelId || !userData) {
-            return res.status(404).json({ success: false, message: 'Établissement ou utilisateur non trouvé.' });
-        }
-
-        const isPasswordValid = await bcrypt.compare(password, userData.password);
-
-        if (!isPasswordValid) {
-            return res.status(401).json({ success: false, message: 'Mot de passe incorrect.' });
-        }
-
-        // ✉️ Envoi de l'e-mail de notification de connexion unifié
-        await sendThePulseEmail(
-            email,
-            "Nouvelle connexion à votre espace",
-            `
-            <p>Bonjour,</p>
-            <p>Une connexion réussie a été enregistrée pour votre établissement <strong>${foundHotelId}</strong>.</p>
-            <p>Si vous êtes à l'origine de cette action, aucune action n'est requise.</p>
-            `
-        );
-
-        res.json({ 
-            success: true, 
-            hotelName: foundHotelId, 
-            message: 'Connexion serveur réussie.' 
-        });
-
-    } catch (error) {
-        console.error("Erreur Login :", error.message);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// ==========================================
-// 🔑 GESTION DU MOT DE PASSE OUBLIÉ & RÉINITIALISATION
-// ==========================================
-
-// A. Vérifier si l'e-mail existe et renvoyer dynamiquement l'hôtel associé
-app.post('/api/auth/check-email', async (req, res) => {
-    try {
-        const { email } = req.body;
-        if (!email) {
-            return res.status(400).json({ success: false, message: "E-mail requis." });
-        }
-
-        const cleanEmail = email.trim().toLowerCase();
-        const hotelsSnapshot = await db.collection('hotels').get();
-        let foundHotelId = null;
-
-        for (const hotelDoc of hotelsSnapshot.docs) {
-            const hotelId = hotelDoc.id;
-            const userDocRef = db.collection('hotels').doc(hotelId).collection('users').doc(cleanEmail);
-            const userDocSnap = await userDocRef.get();
-
-            if (userDocSnap.exists) {
-                foundHotelId = hotelId;
-                break;
-            }
-        }
-
-        if (!foundHotelId) {
-            return res.status(404).json({ success: false, message: "Aucun compte associé à cet e-mail." });
-        }
-
-        res.json({ success: true, hotelName: foundHotelId });
-    } catch (error) {
-        console.error("Erreur Check Email :", error);
-        res.status(500).json({ success: false, message: error.message });
-    }
-});
-
-// B. Envoyer le lien de réinitialisation via l'API HTTP de Brevo (Port 443 - Jamais bloqué par Render)
-app.post('/api/auth/forgot-password', async (req, res) => {
-    try {
-        const { email } = req.body;
-        if (!email) {
-            return res.status(400).json({ success: false, message: "E-mail requis." });
-        }
-
-        const cleanEmail = email.trim().toLowerCase();
-        const hotelsSnapshot = await db.collection('hotels').get();
-        let foundHotelId = null;
-
-        for (const hotelDoc of hotelsSnapshot.docs) {
-            const hotelId = hotelDoc.id;
-            const userDocSnap = await db.collection('hotels').doc(hotelId).collection('users').doc(cleanEmail).get();
-            if (userDocSnap.exists) {
-                foundHotelId = hotelId;
-                break;
-            }
-        }
-
-        if (!foundHotelId) {
-            return res.status(404).json({ success: false, message: "E-mail introuvable." });
-        }
-
-        // Génération du jeton sécurisé (valable 30 minutes)
-        const resetToken = crypto.randomBytes(32).toString('hex');
-        const expiresAt = Date.now() + (30 * 60 * 1000);
-
-        await db.collection('password_resets').doc(resetToken).set({
-            email: cleanEmail,
-            hotelId: foundHotelId,
-            expiresAt: expiresAt,
-            used: false,
-            createdAt: Date.now()
-        });
-
-        const frontendBaseUrl = (req.headers.origin || req.headers.referer || '').includes('centillion.online') 
-            ? 'https://thepulse.centillion.online' 
-            : 'http://localhost:3000';
-
-        const resetLink = `${frontendBaseUrl}/reset-password.html?token=${resetToken}`;
-
-        // 🚀 Envoi de l'e-mail via la fonction unifiée (Bouton orange)
-        const subject = "Réinitialisation de mot de passe";
-        const mainContent = `
-            <p>Vous avez demandé la réinitialisation de votre mot de passe pour votre établissement <strong>${foundHotelId}</strong>.</p>
-            <p>Cliquez sur le bouton ci-dessous pour définir un nouveau mot de passe. <strong>Ce lien expirera dans 30 minutes.</strong></p>
-            <div style="text-align: center; margin: 30px 0;">
-                <a href="${resetLink}" style="background-color: #d17634; color: white; padding: 14px 28px; text-decoration: none; border-radius: 8px; font-weight: bold; display: inline-block;">Réinitialiser mon mot de passe</a>
-            </div>
-        `;
-        await sendThePulseEmail(cleanEmail, subject, mainContent);
-
-        res.json({ success: true, message: "E-mail de réinitialisation envoyé avec succès." });
-    } catch (error) {
-        console.error("Erreur Forgot Password :", error);
-        res.status(500).json({ success: false, message: "Erreur lors de l'envoi de l'e-mail." });
-    }
-});
-
-// C. Valider le jeton, vérifier l'expiration (5 min) et mettre à jour le mot de passe hashé
-app.post('/api/auth/reset-password', async (req, res) => {
-    try {
-        const { token, newPassword } = req.body;
-        if (!token || !newPassword) {
-            return res.status(400).json({ success: false, message: "Données manquantes." });
-        }
-
-        const tokenRef = db.collection('password_resets').doc(token);
-        const tokenSnap = await tokenRef.get();
-
-        if (!tokenSnap.exists) {
-            return res.status(400).json({ success: false, message: "Lien invalide ou expiré." });
-        }
-
-        const tokenData = tokenSnap.data();
-
-        // Vérification stricte de l'expiration (30 minutes) et de l'utilisation unique
-        if (tokenData.used || Date.now() > tokenData.expiresAt) {
-            return res.status(400).json({ success: false, message: "Ce lien a expiré ou a déjà été utilisé." });
-        }
-
-        // Hashage du nouveau mot de passe via bcrypt
-        const salt = await bcrypt.genSalt(10);
-        const hashedPassword = await bcrypt.hash(newPassword, salt);
-
-        // Mise à jour du mot de passe dans l'arborescence Firestore de l'hôtel
-        const userDocRef = db.collection('hotels').doc(tokenData.hotelId).collection('users').doc(tokenData.email);
-        await userDocRef.update({
-            password: hashedPassword,
-            updatedAt: Date.now()
-        });
-
-        // Consommer le jeton pour qu'il ne soit plus réutilisable
-        await tokenRef.update({ used: true });
-
-        res.json({ success: true, message: "Mot de passe mis à jour avec succès." });
-    } catch (error) {
-        console.error("Erreur Reset Password :", error);
-        res.status(500).json({ success: false, message: error.message });
-    }
-});
-
-// ==========================================
-// 2. ROUTES GESTION DES TOTEMS
-// ==========================================
-app.get('/api/hotels/:uid/totems', async (req, res) => {
-    try {
-        const { uid } = req.params;
-        const snapshot = await db.collection('hotels').doc(uid).collection('totems').get();
-        let totems = {};
-        snapshot.forEach(doc => {
-            totems[doc.id] = doc.data();
-        });
-        res.json({ success: true, data: totems });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-app.post('/api/hotels/:uid/totems', async (req, res) => {
-    try {
-        const { uid } = req.params;
-        const { name, orientation } = req.body;
-        
-        if (!name) {
-            return res.status(400).json({ success: false, error: "Le nom du totem est requis" });
-        }
-
-        const totemsRef = db.collection('hotels').doc(uid).collection('totems');
-        const snapshot = await totemsRef.get();
-
-        const cleanOrientation = (orientation || '').trim().toLowerCase();
-        const orientationCode = (cleanOrientation === 'paysage' || cleanOrientation.startsWith('l')) ? 'L' : 'P';
-
-        let maxNumber = 0;
-        snapshot.forEach(doc => {
-            const parts = doc.id.split('-');
-            if (parts.length === 3 && parts[1] === orientationCode) {
-                const num = parseInt(parts[2], 10);
-                if (!isNaN(num) && num > maxNumber) {
-                    maxNumber = num;
-                }
-            }
-        });
-        
-        const nextNumber = maxNumber + 1;
-        const totemId = `TOT-${orientationCode}-${nextNumber}`;
-
-        const totemRef = totemsRef.doc(totemId);
-        const totemData = { 
-            name: name.trim(), 
-            orientation: orientation || 'Portrait', 
-            createdAt: Date.now(),
-            totemId: totemId
-        };
-        
-        await totemRef.set(totemData, { merge: true });
-
-        notifyTotems(uid);
-
-        res.json({ success: true, message: 'Totem ajouté avec succès', id: totemId, totem: totemData });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-app.delete('/api/hotels/:uid/totems/:totemId', async (req, res) => {
-    try {
-        const { uid, totemId } = req.params;
-        
-        const totemRef = db.collection('hotels').doc(uid).collection('totems').doc(totemId);
-        
-        const totemDoc = await totemRef.get();
-        if (totemDoc.exists) {
-            const totemData = totemDoc.data();
-            const totemName = totemData.name;
-
-            if (totemName) {
-                const mediaDocRef = db.collection('hotels').doc(uid).collection('media').doc(totemName);
-                const mediaDoc = await mediaDocRef.get();
-
-                if (mediaDoc.exists) {
-                    const mediaData = mediaDoc.data();
-
-                    for (const mediaId of Object.keys(mediaData)) {
-                        const mediaItem = mediaData[mediaId];
-                        if (mediaItem && mediaItem.url && mediaItem.url.includes('supabase.co')) {
-                            try {
-                                const urlParts = mediaItem.url.split('/');
-                                const fileName = urlParts[urlParts.length - 1];
-                                if (fileName) {
-                                    await supabase.storage
-                                        .from('media')
-                                        .remove([decodeURIComponent(fileName)]);
-                                }
-                            } catch (storageErr) {
-                                console.error("Erreur suppression Supabase pour le média", mediaId, storageErr);
-                            }
-                        }
-                    }
-
-                    await mediaDocRef.delete();
-                }
-            }
-        }
-
-        await totemRef.delete();
-
-        notifyTotems(uid);
-
-        res.json({ success: true, message: 'Totem et médias associés supprimés avec succès.' });
-    } catch (error) {
-        console.error("Erreur lors de la suppression du totem :", error);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-const { FieldValue } = require('firebase-admin').firestore;
-
-// ==========================================
-// ROUTE GET : Récupérer tous les médias
-// ==========================================
-app.get('/api/hotels/:uid/media', async (req, res) => {
-    try {
-        const { uid } = req.params;
-        const mediaRef = db.collection('hotels').doc(uid).collection('media');
-        const totemsSnapshot = await mediaRef.get();
-        
-        let allMediaData = {};
-
-        totemsSnapshot.forEach(totemDoc => {
-            const totemName = totemDoc.id;
-            allMediaData[totemName] = totemDoc.data() || {};
-        });
-
-        res.json({ success: true, data: allMediaData });
-    } catch (error) {
-        console.error("Erreur API media:", error);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// ==========================================
-// ROUTE POST : Ajouter/Mettre à jour un média
-// ==========================================
-app.post('/api/hotels/:uid/media/:totemName', async (req, res) => {
-    try {
-        const { uid, totemName } = req.params;
-        const mediaData = req.body;
-        const mediaId = mediaData.id || `media_${Date.now()}`;
-        
-        const totemDocRef = db.collection('hotels')
-                                   .doc(uid)
-                                   .collection('media')
-                                   .doc(totemName);
-        
-        await totemDocRef.set({
-            [mediaId]: {
-                ...mediaData,
-                createdAt: Date.now()
-            }
-        }, { merge: true });
-
-        notifyTotems(uid);
-
-        res.json({ success: true, message: 'Média enregistré avec succès.', mediaId });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-app.delete('/api/hotels/:uid/media/:totemName/:mediaId', async (req, res) => {
-    try {
-        const { uid, totemName, mediaId } = req.params;
-        
-        const totemDocRef = db.collection('hotels')
-                                .doc(uid)
-                                .collection('media')
-                                .doc(totemName);
-                                
-        const docSnap = await totemDocRef.get();
-        if (!docSnap.exists) {
-            return res.status(404).json({ success: false, error: "Totem introuvable." });
-        }
-
-        const totemData = docSnap.data();
-        const mediaData = totemData[mediaId];
-
-        if (!mediaData || !mediaData.url) {
-            return res.status(400).json({ success: false, error: "URL du média introuvable dans Firestore." });
-        }
-
-        const cleanUrl = mediaData.url.split('?')[0];
-        const urlParts = cleanUrl.split('/');
-        const fileName = urlParts[urlParts.length - 1];
-
-        if (!fileName) {
-            return res.status(400).json({ success: false, error: "Nom de fichier invalide extrait de l'URL." });
-        }
-
-        const decodedFileName = decodeURIComponent(fileName);
-
-        const { data, error: supabaseError } = await supabase.storage
-            .from('media')
-            .remove([decodedFileName]);
-
-        if (supabaseError) {
-            return res.status(500).json({ success: false, error: "Erreur Supabase: " + supabaseError.message });
-        }
-
-        await totemDocRef.update({
-            [mediaId]: FieldValue.delete()
-        });
-        
-        notifyTotems(uid);
-
-        res.json({ success: true, message: 'Média supprimé avec succès de Supabase et Firestore.' });
-    } catch (error) {
-        console.error("❌ Erreur API delete media:", error);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// ==========================================
-// ROUTE PUT : Mettre à jour l'ordre des médias par lot
-// ==========================================
-app.put('/api/hotels/:uid/media/order', async (req, res) => {
-    try {
-        const { uid } = req.params;
-        const { items } = req.body;
-
-        if (!items || !Array.isArray(items)) {
-            return res.status(400).json({ success: false, error: "Format de données invalide." });
-        }
-
-        const batch = db.batch();
-
-        items.forEach(item => {
-            const totemDocRef = db.collection('hotels')
-                                    .doc(uid)
-                                    .collection('media')
-                                    .doc(item.totemName);
-            
-            batch.update(totemDocRef, {
-                [`${item.mediaId}.order`]: item.order
+        if (docSnap.exists && !force) {
+            const existingData = docSnap.data();
+            // On renvoie un 200 avec conflict: true pour garder la console propre
+            return res.status(200).json({ 
+                success: false, 
+                conflict: true,
+                existingMatricule: id,
+                existingName: `${existingData.nom || ''} ${existingData.prenom || ''}`.trim(),
+                error: `Le matricule "${id}" existe déjà pour ${existingData.nom} ${existingData.prenom}.` 
             });
-        });
+        }
+
+        // 2. Vérification des doublons de Nom & Prénom sur les autres documents
+        const snapshot = await db.collection('sofitel_cotonou_staff').get();
+        let oldDocRefToClean = null;
+        let creationDate = new Date().toISOString();
+
+        for (const doc of snapshot.docs) {
+            const existingData = doc.data();
+            const existingNom = (existingData.nom || '').trim().toLowerCase();
+            const existingPrenom = (existingData.prenom || '').trim().toLowerCase();
+
+            if (nomToCheck && prenomToCheck && existingNom === nomToCheck && existingPrenom === prenomToCheck) {
+                if (doc.id !== id) {
+                    oldDocRefToClean = doc.ref; 
+                    if (existingData.createdAt) {
+                        creationDate = existingData.createdAt; 
+                    }
+                } else if (docSnap.exists && docSnap.data().createdAt) {
+                    creationDate = docSnap.data().createdAt;
+                }
+
+                if (!force && doc.id !== id) {
+                    return res.status(200).json({ 
+                        success: false, 
+                        conflict: true,
+                        existingMatricule: doc.id,
+                        existingName: `${existingData.nom || ''} ${existingData.prenom || ''}`.trim(),
+                        error: `L'employé existe déjà sous un autre matricule.` 
+                    });
+                }
+            }
+        }
+
+        // 3. Construction des données de l'employé
+        const staffPayload = {
+            sftId: id,
+            nom: data.nom || '',
+            prenom: data.prenom || '',
+            genre: data.genre || 'M',
+            email: data.email || '',
+            phone: data.phone || '',
+            phoneCode: data.phoneCode || '',
+            departement: data.departement || '',
+            Conduite: data.Conduite || 'Non',
+            hotel: data.hotel || 'Sofitel Cotonou Marina',
+            statut: data.statut || 'active',
+            photo: data.photo || '',
+            qrCode: data.qrCode || '',
+            createdAt: creationDate,
+            updatedAt: new Date().toISOString()
+        };
+
+        await docRef.set(staffPayload);
+
+        if (oldDocRefToClean && oldDocRefToClean.id !== id) {
+            await oldDocRefToClean.delete();
+        }
+
+        res.status(200).json({ success: true, message: "Employé enregistré et mis à jour avec succès." });
+        
+    } catch (error) {
+        // Les vraies erreurs techniques (crash serveur, pblm Firestore) écriront dans les logs serveur, masquées pour le client
+        res.status(500).json({ success: false, error: "Erreur interne du serveur." });
+    }
+});
+
+// Route pour supprimer un employé et l'archiver dans 'sofitel_cotonou_staff_gone'
+app.delete('/api/staff/:id', async (req, res) => {
+    try {
+        const { password } = req.body;
+        const adminPassword = process.env.ADMIN_PASSWORD;
+        
+        if (!adminPassword || password !== adminPassword) {
+            return res.status(403).json({ 
+                success: false, 
+                message: "Accès refusé : mot de passe administrateur incorrect ou non configuré." 
+            });
+        }
+
+        const staffId = req.params.id;
+        const activeDocRef = db.collection('sofitel_cotonou_staff').doc(staffId);
+        const docSnap = await activeDocRef.get();
+
+        if (!docSnap.exists) {
+            return res.status(404).json({
+                success: false,
+                message: "Employé introuvable dans la base de données."
+            });
+        }
+
+        const staffData = docSnap.data();
+        const archiveData = {
+            ...staffData,
+            deletedAt: new Date().toISOString()
+        };
+
+        const archiveDocRef = db.collection('sofitel_cotonou_staff_gone').doc(staffId);
+        const batch = db.batch();
+        batch.set(archiveDocRef, archiveData); 
+        batch.delete(activeDocRef);            
 
         await batch.commit();
 
-        notifyTotems(uid);
-
-        res.json({ success: true, message: "Ordre mis à jour avec succès." });
-    } catch (error) {
-        console.error("Erreur API update order:", error);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// ==========================================
-// 5. ROUTES ABONNEMENT
-// ==========================================
-async function updateSubscriptionHandler(req, res) {
-    try {
-        const { uid } = req.params;
-        const { type, subscriptionEnd } = req.body;
-        await db.collection('hotels').doc(uid).collection('subscription').doc('current').set({ type, subscriptionEnd }, { merge: true });
-        res.json({ success: true, message: 'Abonnement mis à jour avec succès.' });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-}
-
-app.route('/api/hotels/:uid/subscription')
-    .get(async (req, res) => {
-        try {
-            const { uid } = req.params;
-            const doc = await db.collection('hotels').doc(uid).collection('subscription').doc('current').get();
-            res.json({ success: true, data: doc.exists ? doc.data() : {} });
-        } catch (error) {
-            res.status(500).json({ success: false, error: error.message });
-        }
-    })
-    .post(updateSubscriptionHandler)
-    .put(updateSubscriptionHandler);
-
-// ==========================================
-// 7. ROUTE INFOS HOTEL
-// ==========================================
-app.get('/api/hotels/:hotelName/info', async (req, res) => {
-    try {
-        const { hotelName } = req.params;
-        const hotelRef = db.collection('hotels').doc(hotelName);
-        const hotelDoc = await hotelRef.get();
-
-        if (!hotelDoc.exists) {
-            return res.status(404).json({ success: false, message: 'Établissement non trouvé.' });
-        }
-
-        const hotelData = hotelDoc.data();
-
-        const subDoc = await hotelRef.collection('subscription').doc('current').get();
-        const subscriptionData = subDoc.exists ? subDoc.data() : {};
-
-        res.json({
-            success: true,
-            hotelName: hotelData.hotelName,
-            hotelID: hotelData.hotelID || hotelName,
-            subscription: subscriptionData
+        res.json({ 
+            success: true, 
+            message: "Employé supprimé et archivé avec succès." 
         });
+
     } catch (error) {
-        console.error("Erreur Hotel Info :", error.message);
-        res.status(500).json({ success: false, error: error.message });
+        console.error("Erreur lors de la suppression/archivage :", error);
+        res.status(500).json({ 
+            success: false, 
+            message: "Erreur interne du serveur : " + error.message
+        });
     }
 });
 
-// ==========================================
-// ROUTE POST : Ajouter un article Worldwide
-// ==========================================
-app.post('/api/hotels/:uid/worldwide/products', async (req, res) => {
-    const { uid } = req.params;
-    const productData = req.body;
-
-    if (!productData.name) {
-        return res.status(400).json({ success: false, error: "Le nom du produit est requis." });
-    }
-
-    const productId = productData.name
-        .trim()
-        .normalize("NFD")
-        .replace(/[\u0300-\u036f]/g, "")
-        .replace(/[^a-zA-Z0-9]/g, "_")
-        .toUpperCase() + "_" + Date.now();
-
-    const payload = {
-        id: productId,
-        createdAt: Date.now(),
-        ...productData
-    };
-
+// Route pour récupérer tous les employés
+app.get('/api/staff', async (req, res) => {
     try {
-        const productRef = db.collection('hotels').doc(uid).collection('worldwide').doc(productId);
-        await productRef.set(payload, { merge: true });
-
-        res.json({ success: true, message: 'Article ajouté avec succès.', productId });
-    } catch (error) {
-        console.error("❌ Erreur API add worldwide product:", error);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// ==========================================
-// ROUTE GET : Récupérer les articles Worldwide
-// ==========================================
-app.get('/api/hotels/:uid/worldwide/products', async (req, res) => {
-    const { uid } = req.params;
-    try {
-        const snapshot = await db.collection('hotels').doc(uid).collection('worldwide').get();
-        let products = {};
+        const snapshot = await db.collection('sofitel_cotonou_staff').get();
+        const staffList = [];
         snapshot.forEach(doc => {
-            if (doc.id !== 'config') {
-                products[doc.id] = doc.data();
-            }
+            staffList.push({ id: doc.id, ...doc.data() });
         });
-        res.json({ success: true, data: products });
+        res.status(200).json(staffList);
     } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ error: error.message });
     }
 });
 
-// ==========================================
-// ROUTE DELETE : Supprimer un article Worldwide
-// ==========================================
-app.delete('/api/hotels/:uid/worldwide/products/:productId', async (req, res) => {
-    const { uid, productId } = req.params;
+// Route pour récupérer un employé spécifique par son ID ou sftId
+app.get('/api/staff/:id', async (req, res) => {
     try {
-        const productRef = db.collection('hotels').doc(uid).collection('worldwide').doc(productId);
-        
-        const docSnap = await productRef.get();
+        const searchId = decodeURIComponent(req.params.id).trim();
+        let docRef = db.collection('sofitel_cotonou_staff').doc(searchId);
+        let docSnap = await docRef.get();
+
         if (docSnap.exists) {
-            const productData = docSnap.data();
-            if (productData.imageUrl && productData.imageUrl.includes('supabase.co')) {
-                try {
-                    const cleanUrl = productData.imageUrl.split('?')[0];
-                    const urlParts = cleanUrl.split('/');
-                    const fileName = urlParts[urlParts.length - 1];
-                    const folderName = urlParts[urlParts.length - 2];
+            return res.status(200).json(docSnap.data());
+        }
+
+        const snapshot = await db.collection('sofitel_cotonou_staff')
+            .where('sftId', '==', searchId)
+            .get();
+
+        if (!snapshot.empty) {
+            return res.status(200).json(snapshot.docs[0].data());
+        }
+
+        res.status(404).json({ error: "Employé non trouvé" });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'admin.html'));
+});
+
+// Route d'upload vers Supabase Storage (format prenom_nom_matricule.ext)
+app.post('/upload-photo', upload.single('photo'), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ error: "Aucun fichier fourni." });
+        }
+
+        // Récupération des champs envoyés par le frontend
+        const rawPrenom = req.body.prenom || 'employe';
+        const rawNom = req.body.nom || '';
+        const rawMatricule = req.body.matricule || 'SFT-0000';
+
+        // Fonction de nettoyage des caractères spéciaux et des accents
+        const sanitize = (str) => {
+            return str
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .toLowerCase()
+                .replace(/[^a-z0-9]/g, '_')
+                .replace(/_+/g, '_') // Évite les doubles underscores
+                .replace(/^_|_$/g, ''); // Supprime les underscores au début/fin
+        };
+
+        const cleanPrenom = sanitize(rawPrenom);
+        const cleanNom = sanitize(rawNom);
+        const cleanMatricule = sanitize(rawMatricule);
+
+        const fileExt = req.file.originalname.split('.').pop();
+        
+        // Format final : prenom_nom_matricule.ext (ex: severin_bosse_sft_a599400q699z.jpg)
+        const fileName = `${cleanPrenom}_${cleanNom}_${cleanMatricule}.${fileExt}`;
+        const filePath = `staff-photos/${fileName}`;
+
+        console.log(`📤 Upload vers Supabase du fichier : ${filePath}`);
+
+        const { data, error } = await supabase.storage
+            .from('staff-photos') 
+            .upload(filePath, req.file.buffer, {
+                contentType: req.file.mimetype,
+                upsert: true // Écrase l'ancienne photo si elle existe déjà pour cet employé
+            });
+
+        if (error) throw error;
+
+        const { data: publicUrlData } = supabase.storage
+            .from('staff-photos')
+            .getPublicUrl(filePath);
+
+        res.json({ url: publicUrlData.publicUrl });
+    } catch (err) {
+        console.error("❌ Erreur Supabase Storage:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Route centralisée pour exécuter les actions sécurisées sur la base de données
+app.post('/api/executeDbAction', async (req, res) => {
+    try {
+        const { password, action, collection, id } = req.body;
+        const adminPassword = process.env.ADMIN_PASSWORD;
+
+        if (!adminPassword || password !== adminPassword) {
+            return res.status(403).json({ 
+                success: false, 
+                message: "Accès refusé : mot de passe administrateur incorrect ou non configuré." 
+            });
+        }
+
+        if (action === 'delete') {
+            if (!collection || !id) {
+                return res.status(400).json({ success: false, message: "Paramètres manquants." });
+            }
+
+            await db.collection(collection).doc(id).delete();
+
+            return res.json({ 
+                success: true, 
+                message: "Suppression effectuée avec succès." 
+            });
+        }
+
+        res.status(400).json({ success: false, message: "Action inconnue." });
+
+    } catch (error) {
+        console.error("Erreur serveur executeDbAction :", error);
+        res.status(500).json({ 
+            success: false, 
+            message: "Erreur interne du serveur : " + error.message 
+        });
+    }
+});
+
+// 1. Récupérer la liste des utilisateurs supprimés (staff_gone)
+app.get('/api/staff-gone', async (req, res) => {
+    try {
+        const snapshot = await db.collection('sofitel_cotonou_staff_gone').get();
+        const staffList = [];
+        snapshot.forEach(doc => {
+            staffList.push({ id: doc.id, ...doc.data() });
+        });
+        res.json(staffList);
+    } catch (error) {
+        console.error("Erreur fetch staff-gone:", error);
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// 2. Restaurer un utilisateur
+app.post('/api/staff/restore/:id', async (req, res) => {
+    try {
+        const { password } = req.body;
+        const adminPassword = process.env.ADMIN_PASSWORD;
+
+        if (!adminPassword || password !== adminPassword) {
+            return res.status(401).json({ success: false, message: "Mot de passe administrateur incorrect." });
+        }
+
+        const staffId = req.params.id;
+        const goneDocRef = db.collection('sofitel_cotonou_staff_gone').doc(staffId);
+        const goneDoc = await goneDocRef.get();
+
+        if (!goneDoc.exists) {
+            return res.status(404).json({ success: false, message: "Utilisateur introuvable dans les archives." });
+        }
+
+        const staffData = goneDoc.data();
+        staffData.statut = 'active';
+        delete staffData.deletedAt;
+
+        await db.collection('sofitel_cotonou_staff').doc(staffId).set(staffData);
+        await goneDocRef.delete();
+
+        res.json({ success: true, message: "Utilisateur restauré avec succès." });
+    } catch (error) {
+        console.error("Erreur restore:", error);
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// 3. Supprimer définitivement un utilisateur de staff_gone (Supabase & Firestore)
+app.delete('/api/staff-gone/:id', async (req, res) => {
+    try {
+        const { password } = req.body;
+        const adminPassword = process.env.ADMIN_PASSWORD;
+
+        if (!adminPassword || password !== adminPassword) {
+            return res.status(401).json({ success: false, message: "Mot de passe administrateur incorrect." });
+        }
+
+        const staffId = req.params.id;
+        const docRef = db.collection('sofitel_cotonou_staff_gone').doc(staffId);
+        const docSnap = await docRef.get();
+
+        if (!docSnap.exists) {
+            return res.status(404).json({ success: false, message: "Utilisateur introuvable dans les archives." });
+        }
+
+        const staffData = docSnap.data();
+
+        // 🗑️ ÉTAPE 1 : SUPPRESSION SUR SUPABASE STORAGE
+        if (staffData.photo && staffData.photo.includes('supabase.co')) {
+            try {
+                // Extraction du chemin relatif depuis l'URL publique
+                const urlObj = new URL(staffData.photo);
+                const pathSegments = urlObj.pathname.split('/public/staff-photos/');
+                
+                if (pathSegments.length > 1) {
+                    let relativePath = decodeURIComponent(pathSegments[1].split('?')[0]);
                     
-                    if (fileName) {
-                        const filePathInBucket = `${decodeURIComponent(folderName)}/${decodeURIComponent(fileName)}`;
-                        
-                        await supabase.storage
-                            .from('media')
-                            .remove([filePathInBucket]);
+                    // Si le fichier est dans le sous-dossier staff-photos du bucket
+                    if (!relativePath.startsWith('staff-photos/')) {
+                        relativePath = `staff-photos/${relativePath}`;
                     }
-                } catch (storageErr) {
-                    console.error("Erreur suppression image Supabase:", storageErr);
+
+                    console.log(`🗑️ Suppression dans Supabase du chemin : ${relativePath}`);
+                    
+                    const { data, error: supabaseError } = await supabase.storage
+                        .from('staff-photos')
+                        .remove([relativePath]);
+
+                    if (supabaseError) {
+                        console.error("❌ Échec Supabase Storage :", supabaseError);
+                        return res.status(500).json({ 
+                            success: false, 
+                            message: "Échec de la suppression du média sur Supabase : " + supabaseError.message 
+                        });
+                    }
+                    console.log("✅ Fichier supprimé avec succès de Supabase :", data);
                 }
+            } catch (storageErr) {
+                console.error("❌ Erreur technique Supabase :", storageErr);
+                return res.status(500).json({ 
+                    success: false, 
+                    message: "Erreur lors du traitement du fichier distant sur Supabase." 
+                });
             }
         }
 
-        await productRef.delete();
-        res.json({ success: true, message: 'Article et image supprimés avec succès de Supabase et Firestore.' });
+        // ÉTAPE 2 : SUPPRESSION DANS FIRESTORE
+        await docRef.delete();
+
+        res.json({ success: true, message: "Média sur Supabase et utilisateur supprimés définitivement avec succès." });
     } catch (error) {
-        console.error("❌ Erreur API delete worldwide product:", error);
-        res.status(500).json({ success: false, error: error.message });
+        console.error("❌ Erreur permanent delete:", error);
+        res.status(500).json({ success: false, message: error.message });
     }
 });
 
-// ==========================================
-// ROUTE GET : Récupérer la configuration Worldwide
-// ==========================================
-app.get('/api/hotels/:uid/worldwide', async (req, res) => {
-    const { uid } = req.params;
-    try {
-        const configDoc = await db.collection('hotels').doc(uid).collection('worldwide').doc('config').get();
-        res.json({ success: true, data: configDoc.exists ? configDoc.data() : {} });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// ==========================================
-// ROUTE POST : Sauvegarder la configuration Worldwide
-// ==========================================
-app.post('/api/hotels/:uid/worldwide/config', async (req, res) => {
-    const { uid } = req.params;
-    const configData = req.body;
-    try {
-        const configRef = db.collection('hotels').doc(uid).collection('worldwide').doc('config');
-        await configRef.set(configData, { merge: true });
-        res.json({ success: true, message: 'Configuration enregistrée avec succès.' });
-    } catch (error) {
-        console.error("❌ Erreur API save worldwide config:", error);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// ==========================================
-// ROUTE SSE (Server-Sent Events) pour les Totems
-// ==========================================
-let totemClients = {};
-
-app.get('/api/hotels/:uid/events', (req, res) => {
-    const { uid } = req.params;
-    
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.flushHeaders();
-
-    if (!totemClients[uid]) {
-        totemClients[uid] = [];
-    }
-    totemClients[uid].push(res);
-
-    req.on('close', () => {
-        totemClients[uid] = totemClients[uid].filter(client => client !== res);
-    });
-});
-
-function notifyTotems(uid) {
-    if (totemClients[uid]) {
-        totemClients[uid].forEach(client => {
-            client.write(`data: update\n\n`);
-        });
-    }
-}
-
-// 8. Lancement dynamique du serveur selon l'environnement
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3005;
 app.listen(PORT, () => {
-    console.log(`🚀 Serveur en ligne [Mode: ${isProduction ? 'PRODUCTION' : 'LOCAL'}] sur le port ${PORT}`);
+    console.log(`Serveur backend SAP démarré sur le port ${PORT}`);
 });
